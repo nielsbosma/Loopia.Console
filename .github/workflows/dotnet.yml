@@ -26,6 +26,7 @@ jobs:
     if: github.event_name == 'release'
     needs: build-and-test
     runs-on: ubuntu-latest
+    environment: production  # must match the nuget.org trusted publishing policy
     permissions:
       contents: read
       id-token: write  # OIDC token for NuGet trusted publishing
