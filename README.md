@@ -35,6 +35,12 @@ macOS); `LOOPIA_CONFIG_DIR` moves it elsewhere.
 Because the encryption is tied to your user account, the store is not portable — copy it to
 another machine or user and the passwords will no longer decrypt.
 
+DPAPI needs your Windows logon credentials, so it fails in a session that has none, such as an
+SSH login with a key ("Access is denied"). Set `LOOPIA_SECRET_STORE=keyfile` to use the AES-GCM
+key file on Windows too; it works in SSH, RDP and console sessions alike. The key file
+(`accounts.key`) sits next to `accounts.json` and keeps the ACL of your profile folder. Passwords
+saved either way can still be read after you change the setting; `dpapi` forces the default.
+
 ```bash
 loopia account list            # show the stored accounts, never their passwords
 loopia account list --paths    # also show where they live and how they are encrypted
