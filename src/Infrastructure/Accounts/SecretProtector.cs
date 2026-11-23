@@ -6,43 +6,104 @@ namespace Loopia.Console.Infrastructure.Accounts;
 
 /// <summary>
 /// Encrypts account passwords at rest so the store never holds plain text.
-/// On Windows this is DPAPI bound to the current user; elsewhere it is AES-GCM
-/// with a key kept in a 0600 key file next to the store.
+/// On Windows this is DPAPI bound to the current user by default; elsewhere, and on Windows when
+/// <c>LOOPIA_SECRET_STORE=keyfile</c>, it is AES-GCM with a key kept in a key file next to the store.
 /// </summary>
+/// <remarks>
+/// DPAPI needs the user's logon credentials, so it fails in sessions that have none, such as an
+/// OpenSSH login with a key. The key file works in every session. Values written with the key file
+/// on Windows carry <see cref="KeyFilePrefix"/>, so either kind can be read back whatever the
+/// current setting is.
+/// </remarks>
 public static class SecretProtector
 {
     private static readonly byte[] Entropy = "Loopia.Console/accounts/v1"u8.ToArray();
 
-    public static string Describe() => OperatingSystem.IsWindows()
-        ? "DPAPI (current Windows user)"
-        : "AES-GCM (local key file)";
+    private const string KeyFilePrefix = "aesgcm:";
+
+    public const string StoreVariable = "LOOPIA_SECRET_STORE";
+
+    private static bool UseKeyFile
+    {
+        get
+        {
+            var forced = Environment.GetEnvironmentVariable(StoreVariable)?.Trim().ToLowerInvariant();
+            return forced switch
+            {
+                null or "" => !OperatingSystem.IsWindows(),
+                "keyfile" => true,
+                "dpapi" when OperatingSystem.IsWindows() => false,
+                _ => throw new InvalidOperationException(
+                    $"{StoreVariable}='{forced}' is not available on this platform. " +
+                    (OperatingSystem.IsWindows() ? "Use 'dpapi' or 'keyfile', or unset it." : "Use 'keyfile', or unset it.")),
+            };
+        }
+    }
+
+    public static string Describe() => UseKeyFile
+        ? $"AES-GCM (key file {AccountStore.KeyFilePath})"
+        : "DPAPI (current Windows user)";
 
     public static string Protect(string plainText)
     {
         var bytes = Encoding.UTF8.GetBytes(plainText);
-        return Convert.ToBase64String(OperatingSystem.IsWindows()
-            ? ProtectedData.Protect(bytes, Entropy, DataProtectionScope.CurrentUser)
-            : AesProtect(bytes));
+        if (!UseKeyFile)
+            return Convert.ToBase64String(DpapiProtect(bytes));
+
+        var cipher = Convert.ToBase64String(AesProtect(bytes));
+        // Linux and macOS keep the unprefixed format they have always written.
+        return OperatingSystem.IsWindows() ? KeyFilePrefix + cipher : cipher;
     }
 
     public static string Unprotect(string cipherText)
     {
+        var keyFile = cipherText.StartsWith(KeyFilePrefix, StringComparison.Ordinal);
         byte[] bytes;
         try
         {
-            bytes = Convert.FromBase64String(cipherText);
+            bytes = Convert.FromBase64String(keyFile ? cipherText[KeyFilePrefix.Length..] : cipherText);
         }
         catch (FormatException)
         {
             throw new InvalidOperationException("The stored password is corrupt. Recreate the account with 'loopia account create'.");
         }
 
+        if (!keyFile && OperatingSystem.IsWindows())
+            return Encoding.UTF8.GetString(DpapiUnprotect(bytes));
+
         try
         {
-            var plain = OperatingSystem.IsWindows()
-                ? ProtectedData.Unprotect(bytes, Entropy, DataProtectionScope.CurrentUser)
-                : AesUnprotect(bytes);
-            return Encoding.UTF8.GetString(plain);
+            return Encoding.UTF8.GetString(AesUnprotect(bytes));
+        }
+        catch (CryptographicException)
+        {
+            throw new InvalidOperationException(
+                $"The stored password could not be decrypted with the key file {AccountStore.KeyFilePath}. " +
+                "It was encrypted with another key file, user or machine; recreate the account with 'loopia account create'.");
+        }
+    }
+
+    private static byte[] DpapiProtect(byte[] plain)
+    {
+        try
+        {
+            return ProtectedData.Protect(plain, Entropy, DataProtectionScope.CurrentUser);
+        }
+        catch (CryptographicException ex)
+        {
+            throw DpapiUnavailable(ex);
+        }
+    }
+
+    private static byte[] DpapiUnprotect(byte[] cipher)
+    {
+        try
+        {
+            return ProtectedData.Unprotect(cipher, Entropy, DataProtectionScope.CurrentUser);
+        }
+        catch (CryptographicException ex) when (IsAccessDenied(ex))
+        {
+            throw DpapiUnavailable(ex);
         }
         catch (CryptographicException)
         {
@@ -51,6 +112,14 @@ public static class SecretProtector
                 "recreate the account with 'loopia account create'.");
         }
     }
+
+    private static bool IsAccessDenied(CryptographicException ex) => ex.HResult == unchecked((int)0x80070005);
+
+    private static InvalidOperationException DpapiUnavailable(CryptographicException ex) => new(
+        $"Windows DPAPI is not available in this session ({ex.Message.TrimEnd('.')}). " +
+        "This happens when you are signed in without a password, for example over SSH with a key. " +
+        $"Set {StoreVariable}=keyfile to keep passwords encrypted with a key file in {AccountStore.DirectoryPath} instead, " +
+        "then run 'loopia account create' (again) for each account.");
 
     private const int NonceSize = 12;
     private const int TagSize = 16;
@@ -94,7 +163,10 @@ public static class SecretProtector
         return key;
     }
 
-    /// <summary>Makes a file readable and writable by its owner only. No-op on Windows, where ACLs already inherit.</summary>
+    /// <summary>
+    /// Makes a file readable and writable by its owner only. On Windows the file keeps the ACL it
+    /// inherits from the user profile (the user, SYSTEM and Administrators).
+    /// </summary>
     public static void RestrictToOwner(string path)
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
